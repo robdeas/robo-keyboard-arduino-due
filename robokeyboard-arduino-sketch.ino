@@ -1,29 +1,31 @@
 /*
- * This file is part of Robokeyboard.
- *
  * Copyright (C) 2024 Rob Deas
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * (at your option) any later version.   
+
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.   
  */
 #include <Keyboard.h>
+#include <sam.h>
 #include <HID.h>
 
-// Define a struct to represent key mappings
+// Define constants and structs
 struct KeyMapping {
   const char* text;
   uint8_t keyCode;
 };
+
+String normalizeCommand(const String& command);
 
 enum CommandType {
   HELP,
@@ -58,10 +60,62 @@ enum CommandType {
   CMD_CONNECT,
   CMD_DISCONNECT,
   CMD_RECONNECT,
+  CMD_STOP,    // Added STOP command
+  CMD_PAUSE,   // Added PAUSE command
+  CMD_RESUME,  // Added RESUME command
   RELEASE_KEY,
   RELEASE_ALL_KEYS,
   INVALID
 };
+
+struct Command {
+  const char* name;
+  CommandType type;
+  bool hasParameter;  // Indicate if this command expects a parameter
+};
+
+Command knownCommands[] = {
+  { "HELP", HELP, false },
+  { "TYPE:HELP", TYPE_HELP, false },
+  { "PING", PING, false },
+  { "STATUS", STATUS, false },
+  { "LOREM", LOREM, false },
+  { "LOREM:LINES", LOREM_LINES, false },
+  { "TEXT:", TEXT, true },
+  { "LINE:", LINE, true },
+  { "KEY:", KEY, true },
+  { "COMBO:", COMBO, true },
+  { "EDIT:", EDIT, true },
+  { "HOLD:", HOLD, true },
+  { "CMD:SET:DELAY:", CMD_SET_DELAY, true },
+  { "CMD:SET:DELAY:JITTER:MAX:", CMD_SET_DELAY_JITTER_VALUE, true },
+  { "CMD:SET:KEY:JITTER:MAX:", CMD_SET_KEY_JITTER_VALUE, true },
+  { "CMD:SET:PRESS:LENGTH:", CMD_SET_PRESS_LENGTH, true },
+  { "RELEASE:KEY:", RELEASE_KEY, true },
+  { "RELEASE:ALL", RELEASE_ALL_KEYS, false },
+  { "CMD:OUTPUT:OFF", CMD_OUTPUT_OFF, false },
+  { "CMD:OUTPUT:ON", CMD_OUTPUT_ON, false },
+  { "CMD:RESET", CMD_RESET, false },
+  { "CMD:ECHO:ON", CMD_ECHO_ON, false },
+  { "CMD:ECHO:OFF", CMD_ECHO_OFF, false },
+  { "CMD:DEBUG:ON", CMD_DEBUG_ON, false },
+  { "CMD:DEBUG:OFF", CMD_DEBUG_OFF, false },
+  { "CMD:JITTER:ON", CMD_JITTER_ON, false },
+  { "CMD:JITTER:OFF", CMD_JITTER_OFF, false },
+  { "CMD:KEY:JITTER:ON", CMD_KEY_JITTER_ON, false },
+  { "CMD:KEY:JITTER:OFF", CMD_KEY_JITTER_OFF, false },
+  { "CMD:DELAY:JITTER:ON", CMD_DELAY_JITTER_ON, false },
+  { "CMD:DELAY:JITTER:OFF", CMD_DELAY_JITTER_OFF, false },
+  { "CMD:CONNECT", CMD_CONNECT, false },
+  { "CMD:DISCONNECT", CMD_DISCONNECT, false },
+  { "CMD:RECONNECT", CMD_RECONNECT, false },
+  { "CMD:STOP", CMD_STOP, false },
+  { "CMD:PAUSE", CMD_PAUSE, false },
+  { "CMD:RESUME", CMD_RESUME, false }
+};
+
+
+
 
 // Define an array of key mappings
 KeyMapping keyMappings[] = {
@@ -156,21 +210,77 @@ KeyMapping keyMappings[] = {
 
 const char LF = '\n';
 const char CR = '\r';
-// jitter is intended for testing fragile apis, the jitter value for keys will need to be kept short unless testing debouncing of keypresses for example
-// as otherwise it will give repeated letters sometimes
+
+// Jitter constants
 const int KEY_JITTER_MAX_VALUE = 50;
-// jitter interval between keys will default to larger that for keypress
 const int DELAY_JITTER_MAX_VALUE = 100;
-int keystrokeDelay = 0;  // Initial delay between keystrokes is 0 millisecs but each delay will have a minimum overriding it
-int keyPressLength = 0;  // the time a key will be held down again there will be a minimum
+
+// Global variables
+int keystrokeDelay = 0;  // Initial delay between keystrokes
+int keyPressLength = 0;  // The time a key will be held down
 int keyJitterMaxValue = KEY_JITTER_MAX_VALUE;
 int delayJitterMaxValue = DELAY_JITTER_MAX_VALUE;
 bool isDebugEnabled = true;
 bool isConnected = false;
 bool isEchoEnabled = true;
 bool isStopRequested = false;
+bool isPaused = false;
 bool addKeyJitter = false;
 bool addDelayJitter = false;
+bool isBusy = false;
+bool isInitialStatusShown = false;
+
+// Function prototypes
+void infoMessage(const String& message);
+void debugMessage(const String& message);
+void errorMessage(const String& message);
+void keyPressWaitWithMinimum(int minimum);
+void keyIntervalWaitWithMinimum(int minimum);
+void waitWithMinimumValues(int minimum, int delayMillisSetting, int jitterMaxValue, bool addJitter);
+void sendKey(const String& text, boolean hold);
+void sendKeyCombination(String keys);
+void releaseKey(const String& text);
+void resetArduino();
+void sendEditAction(char actionKey);
+void cut();
+void copy();
+void paste();
+void selectAll();
+void handleEditCommand(const String& text);
+CommandType parseCommandType(const String& command, String& parameter);
+void handleCommand(const String& commandString);
+void processCurrentAction();
+String readSerialUntil(int maxLength);
+void sendReturn();
+void sendPingResponse();
+void sendStatusResponse(bool fullStatus = false);
+void printHelp(bool sendToKeyboard = false);
+bool isReady();
+
+// Define ActionType enum and Action struct for non-blocking operations
+enum ActionType {
+  NONE,
+  SEND_MESSAGE,
+  TYPE_LOREM_IPSUM,
+  TYPE_LOREM_LINES,
+  SEND_KEY,
+  SEND_COMBO,
+  SEND_EDIT,
+  HOLD_KEY,
+  // Add other action types as needed
+};
+
+struct Action {
+  ActionType type;
+  String message;
+  int index;
+  int lineIndex;
+  bool newLine;
+  String parameter;
+  // Add other fields as needed
+};
+
+Action currentAction = { NONE };
 
 void setup() {
   delay(150);
@@ -179,271 +289,61 @@ void setup() {
   Keyboard.begin();
   isConnected = true;
   // Wait for a stable connection (optional)
-  delay(1000);
+  // Wait for Serial connection with a 2-second timeout
+  unsigned long startTime = millis();
+  while (!Serial && (millis() - startTime < 2000)) {
+    // Wait until Serial is connected or timeout of 2 seconds is reached
+  }
   Serial.println("");
   infoMessage("Keyboard emulation started");
   infoMessage("HELP command will print help.");
 }
 
+void restart() {
+  WDT->WDT_MR = WDT_MR_WDDIS;  // Disable the watchdog if enabled
+  // Enable the watchdog with the reset system and very short timeout (1ms)
+  WDT->WDT_MR = WDT_MR_WDV(0xFFF) | WDT_MR_WDRSTEN | WDT_MR_WDD(0xFFF) | WDT_MR_WDDBGHLT | WDT_MR_WDIDLEHLT;
+}
 
-void printHelp(bool sendToKeyboard = false) {
-  // Define the help message
-  const char* helpMessage[] = {
-    "",
-    "ROBO-KEYBOARD",
-    "-------------",
-    "This uses an Arduino Due to act as a virtual keyboard, that can be used for keyboard macros or testing."
-    "",
-    "Usage:",
-    "  HELP - Send this help text to the serial port.",
-    "  TYPE_HELP - Send this help text to the keyboard.",
-    "  PING - Check if the device is responsive",
-    "  STATUS - Get current status of the device",
-    "  LOREM - Type the Lorem Ipsum text on the keyboard",
-    "  LOREM_LINES - Type the Lorem Ipsum text on the keyboard, as 4 lines of",
-    "  TEXT:<message> - Send a message as keystrokes",
-    "  LINE:<message> - Send a message followed by a newline",
-    "  KEY:<key> - Send a single key press",
-    "  COMBO:<keys> - Send a combination of keys (e.g., CTRL-ALT-DEL)",
-    "  EDIT:<action> - Perform an edit action (cut, copy, paste, selectall)",
-    "  HOLD:<key> - Hold a key down",
-    "  RELEASE_KEY:<key> - Release a specific key",
-    "  RELEASE:ALL - Release all held keys",
-    "  CMD:OUTPUT:OFF - Stop sending keys to the keyboard",
-    "  CMD:OUTPUT:ON - Resume sending keys to the keyboard",
-    "  CMD:SET:DELAY:<value> - Set delay between keystrokes",
-    "  CMD:SET:PRESS-LENGTH:<value> - Set the length of key presses",
-    "  CMD:RESET - Reset the device",
-    "  CMD:ECHO:ON - Enable echoing of serial input",
-    "  CMD:ECHO:OFF - Disable echoing of serial input",
-    "  CMD:DEBUG:ON - Enable debug messages",
-    "  CMD:DEBUG:OFF - Disable debug messages",
-    "  CMD:JITTER:ON - Enable jitter for both key press and release timings",
-    "  CMD:JITTER:OFF - Disable jitter for both key press and release timings",
-    "  CMD:KEY_JITTER:ON - Enable jitter for key press timings only",
-    "  CMD:KEY_JITTER:OFF - Disable jitter for key press timings only",
-    "  CMD:DELAY_JITTER:ON - Enable jitter for key interval timings only",
-    "  CMD:DELAY_JITTER:OFF - Disable jitter for key interval timings only",
-    "  CMD:SET:KEY_JITTER_MAX:<value> - Set maximum key press jitter value",
-    "  CMD:SET:DELAY_JITTER_MAX:<value> - Set maximum delay after keypress jitter value",
-    "  CMD:CONNECT - Connect the keyboard",
-    "  CMD:DISCONNECT - Disconnect the keyboard",
-    "  CMD:RECONNECT - Reconnect the keyboard",
-    "",
-    "NOTE: - can be substituted for _ in commands.",
-    "There are some shortnames for keys: @C is CTRL, @S is SHIFT, @A is ALT ",
-    "These @ modifiers will work in combo along wth the f-keys everything else appart from the seperator - there is assumed to be normal keys.",
-    "in the key command you can also use \\R or \\N as RETURN, \\B as BACKSPACE, \\T as TAB.",
-    ""
+void loop() {
 
-  };
+  if (!isInitialStatusShown) {
+    // Send ready message after setup is complete, This is a good place to send the full status
+    sendStatusResponse(true);
+    isInitialStatusShown = true;
+  }
 
-
-  // Send the help message either to the Serial or to the Keyboard
-  for (const char* line : helpMessage) {
-    if (sendToKeyboard) {
-      // Send each line of the help message to the keyboard
-      for (const char* p = line; *p != '\0'; p++) {
-        Keyboard.press(*p);
-        delay(10);
-        Keyboard.release(*p);
-        delay(10);
-      }
-      // Send a newline character after each line
-      Keyboard.press(KEY_RETURN);
-      delay(10);
-      Keyboard.release(KEY_RETURN);
-      delay(10);
-    } else {
-      // Send each line of the help message to the Serial
-      Serial.println(F(line));
+  // Check for serial input
+  if (Serial.available() > 0) {
+    String command = readSerialUntil(4096);  // Read until newline character or max chars
+    if (command.length() > 0) {
+      infoMessage("Command: " + command);
+      handleCommand(command);
     }
   }
+
+  // Process the current action incrementally
+  processCurrentAction();
 }
 
+// Implementations of functions
 
-// Function to find the key code based on text
-uint8_t findKeyCode(const String& text) {
-  for (size_t i = 0; i < sizeof(keyMappings) / sizeof(keyMappings[0]); i++) {
-    if (text.equals(keyMappings[i].text)) {
-      debugMessage("Key found: " + text + ", keyCode: " + String(keyMappings[i].keyCode));
-      return keyMappings[i].keyCode;
-    }
-  }
-  debugMessage("Key not found: " + text);
-  // Return 0 if key not found
-  return 0;
+void infoMessage(const String& message) {
+  Serial.print("INFO:");
+  Serial.println(message);
 }
 
-void sendKeyboardMessage(const String& message, bool newLine = false) {
-  debugMessage("Processing sendMessage to Keyboard: " + message);
-  for (int i = 0; i < message.length(); i++) {
-    char currentChar = message[i];
-    if (isStopRequested) {
-      Keyboard.releaseAll();
-      delay(10);
-      return;
-    }
-    Keyboard.press(currentChar);
-    delay(10);
-    keyPressWaitWithMinimum(10);
-    Keyboard.releaseAll();
-    keyIntervalWaitWithMinimum(10);
-  }
-  if (newLine) sendReturn();
-}
-
-
-void typeLoremIpsum(bool newLine = false) {
-  const char* loremIpsum1 = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
-  const char* loremIpsum2 = "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ";
-  const char* loremIpsum3 = "Duis aute irure dolor in reprehender it in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ";
-  const char* loremIpsum4 = "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
-
-  sendKeyboardMessage(loremIpsum1, newLine);
-  sendKeyboardMessage(loremIpsum2, newLine);
-  sendKeyboardMessage(loremIpsum3, newLine);
-  sendKeyboardMessage(loremIpsum4, newLine);
-}
-
-void sendReturn() {
-  Keyboard.press('\n');
-  keyPressWaitWithMinimum(50);  // Delay before newline (optional, adjust as needed)
-  Keyboard.releaseAll();
-  keyIntervalWaitWithMinimum(50);
-}
-
-void sendPingResponse() {
-  Serial.println("RESPONSE:OK");  // Indicate that the command was received and processed successfully
-}
-
-void sendStatusResponse() {
-  String status = isConnected ? "connected" : "disconnected";
-  Serial.print(F("RESPONSE:{\"app\": \"DueKeys\", \"status\": \""));
-  Serial.print(status);
-  Serial.print(F("\", \"debug\": \""));
-  Serial.print(isDebugEnabled ? "on" : "off");
-  Serial.print(F("\", \"echo\": \""));
-  Serial.print(isEchoEnabled ? "on" : "off");
-  Serial.print(F("\", \"output\": \""));
-  Serial.print(isStopRequested ? "off" : "on");
-  Serial.print(F("\", \"keyJitter\": \""));
-  Serial.print(addKeyJitter ? "on" : "off");
-  Serial.print(F("\", \"delayJitter\": \""));
-  Serial.print(addDelayJitter ? "on" : "off");
-  if (keystrokeDelay != 0) {
-    Serial.print(F("\", \"KeyStrokeDelay\": \""));
-    Serial.print(String(keystrokeDelay));
-  }
-  if (keyPressLength != 0) {
-    Serial.print(F("\", \"keyPressLength\": \""));
-    Serial.print(String(keyPressLength));
-  }
-  if (addKeyJitter && keyJitterMaxValue != 0) {
-    Serial.print(F("\", \"keyJitterMaxValue\": \""));
-    Serial.print(String(keyJitterMaxValue));
-  }
-  if (addDelayJitter && delayJitterMaxValue != 0) {
-    Serial.print(F("\", \"delayJitterMaxValue\": \""));
-    Serial.print(String(delayJitterMaxValue));
-  }
-  Serial.println(F("\", \"version\": \"0.4.1\"}"));
-}
-
-
-CommandType parseCommandType(const String& command) {
-  debugMessage("<" + command + ">");
-  if (command == "HELP") {
-    return HELP;
-  } else if (command == "TYPE_HELP" || command == "TYPE-HELP") {
-    return TYPE_HELP;
-  } else if (command == "PING") {
-    return PING;
-  } else if (command == "STATUS") {
-    return STATUS;
-  } else if (command == "LOREM") {
-    return LOREM;
-  } else if (command == "LOREM_LINES" || command == "LOREM-LINES") {
-    return LOREM_LINES;
-  } else if (command.startsWith("TEXT:")) {
-    // Text is a string that doesnt have a new line
-    return TEXT;
-  } else if (command.startsWith("LINE:")) {
-    // Line is alike text but types a new line
-    return LINE;
-  } else if (command.startsWith("KEY:")) {
-    return KEY;
-    // press and release a key
-  } else if (command.startsWith("COMBO:")) {
-    // combo is a combination of keys eg ctrl-alt-x
-    return COMBO;
-  } else if (command.startsWith("EDIT:")) {
-    // cut copy paste
-    return EDIT;
-  } else if (command.startsWith("HOLD:")) {
-    // holds down a key and doesnt release it
-    return HOLD;
-  } else if (command.startsWith("CMD:SET:DELAY:")) {
-    // an additional delay adter each keypress, delays will be needed anyway, but could still sometimes be too fast
-    return CMD_SET_DELAY;
-  } else if (command.startsWith("CMD:SET:DELAY-JITTER-MAX:") || command.startsWith("CMD:SET:DELAY-JITTER_MAX:")) {
-    // sets the actual max value of jitter but doesnt turn it on or off
-    return CMD_SET_DELAY_JITTER_VALUE;
-  } else if (command.startsWith("CMD:SET:KEY-JITTER-MAX:") || command.startsWith("CMD:SET:KEY_JITTER_MAX:")) {
-    // sets the actual max value of jitter but doesnt turn it on or off
-    return CMD_SET_KEY_JITTER_VALUE;
-  } else if (command.startsWith("CMD:SET:PRESS-LENGTH:") || command.startsWith("CMD:SET:PRESS_LENGTH:")) {
-    // the time a keypress will be held down, delays will be needed anyway, but could still sometimes be too fast
-    return CMD_SET_PRESS_LENGTH;
-  } else if (command.startsWith("RELEASE_KEY:") || command.startsWith("RELEASE-KEY:")) {
-    // release a specific held key
-    return RELEASE_KEY;
-  } else if (command == "RELEASE:ALL") {
-    // release all held keys, note currently using text or line will release automatically
-    return RELEASE_ALL_KEYS;
-  } else if (command == "CMD:OUTPUT:OFF") {
-    // output off just means keys wont be sent to the keyboard until resume, any keypresses will be lost
-    return CMD_OUTPUT_OFF;
-  } else if (command == "CMD:OUTPUT:ON") {
-    // resume sending keys to the keyboard
-    return CMD_OUTPUT_ON;
-  } else if (command == "CMD:RESET") {
-    // reset arduino
-    return CMD_RESET;
-  } else if (command == "CMD:ECHO:ON") {
-    return CMD_ECHO_ON;
-  } else if (command == "CMD:ECHO:OFF") {
-    return CMD_ECHO_OFF;
-  } else if (command == "CMD:DEBUG:ON") {
-    return CMD_DEBUG_ON;
-  } else if (command == "CMD:DEBUG:OFF") {
-    return CMD_DEBUG_OFF;
-  } else if (command == "CMD:JITTER:ON") {
-    // Jitter is intended for testing fragile APIS that might duplicate keys, or have some odd effects
-    return CMD_JITTER_ON;
-  } else if (command == "CMD:JITTER:OFF") {
-    return CMD_JITTER_OFF;
-  } else if (command == "CMD:KEY_JITTER:ON") {
-    // Jitter is intended for testing fragile APIS that might duplicate keys, or have some odd effects
-    return CMD_KEY_JITTER_ON;
-  } else if (command == "CMD:KEY_JITTER:OFF") {
-    return CMD_DELAY_JITTER_OFF;
-  } else if (command == "CMD:DELAY_JITTER:ON") {
-    // Jitter is intended for testing fragile APIS that might duplicate keys, or have some odd effects
-    return CMD_DELAY_JITTER_ON;
-  } else if (command == "CMD:DELAY_JITTER:OFF") {
-    return CMD_DELAY_JITTER_OFF;
-  } else if (command == "CMD:CONNECT") {
-    return CMD_CONNECT;
-  } else if (command == "CMD:DISCONNECT") {
-    return CMD_DISCONNECT;
-  } else if (command == "CMD:RECONNECT") {
-    return CMD_RECONNECT;
-  } else {
-    return INVALID;
+void debugMessage(const String& message) {
+  if (isDebugEnabled) {
+    Serial.print("DEBUG:");
+    Serial.println(message);
   }
 }
 
+void errorMessage(const String& message) {
+  Serial.print("ERROR:");
+  Serial.println(message);
+}
 
 void keyPressWaitWithMinimum(int minimum) {
   waitWithMinimumValues(minimum, keyPressLength, keyJitterMaxValue, addKeyJitter);
@@ -454,12 +354,11 @@ void keyIntervalWaitWithMinimum(int minimum) {
 }
 
 /**
-* there is both a key and a delay jitter they take default values
-*/
+ * Wait with minimum values and optional jitter
+ */
 void waitWithMinimumValues(int minimum, int delayMillisSetting, int jitterMaxValue, bool addJitter) {
   int delayMillis = delayMillisSetting;
   if (addJitter && jitterMaxValue > 0) {
-    // could mean if we fiddle with these values jitter will be tiny or dissapear as there is a minimum
     if (delayMillisSetting == 0) {
       delayMillis = jitterMaxValue + minimum;
     }
@@ -476,6 +375,251 @@ void waitWithMinimumValues(int minimum, int delayMillisSetting, int jitterMaxVal
   if (delayMillis < minimum) delayMillis = minimum;
   if (addJitter) debugMessage("Delay applied: " + String(delayMillis));
   delay(delayMillis);
+}
+
+// Function to find a command and its parameter from the normalized command string
+Command* findCommand(const String& command, String& parameter) {
+  String normalizedCommand = normalizeCommand(command);  // Normalize the command if needed
+
+  // Iterate through knownCommands[] to find a matching command
+  for (Command& cmd : knownCommands) {
+    if (normalizedCommand.startsWith(cmd.name)) {
+      if (cmd.hasParameter) {
+        parameter = command.substring(String(cmd.name).length());  // Extract parameter if expected
+      }
+      return &cmd;
+    }
+  }
+
+  return nullptr;  // Return nullptr if no matching command is found
+}
+
+void processCurrentAction() {
+  // If no action is currently being processed or the system is stopped or paused
+  if (currentAction.type == NONE || isStopRequested || isPaused) {
+    // If the system was busy, but now it's free, update the status once
+    if (isBusy) {
+      isBusy = false;
+      sendStatusResponse();  // Notify that the device is now free
+    }
+    return;
+  }
+
+  // If the system is not busy and is starting an action
+  if (!isBusy) {
+    isBusy = true;         // Mark as busy when starting a new action
+    sendStatusResponse();  // Notify that the device is now busy
+  }
+
+  // Process the current action
+  switch (currentAction.type) {
+    case SEND_MESSAGE:
+      if (currentAction.index < currentAction.message.length()) {
+        char currentChar = currentAction.message[currentAction.index];
+        if (isStopRequested) {
+          Keyboard.releaseAll();
+          currentAction.type = NONE;
+        } else {
+          Keyboard.press(currentChar);
+          keyPressWaitWithMinimum(10);
+          Keyboard.releaseAll();
+          keyIntervalWaitWithMinimum(10);
+          currentAction.index++;
+        }
+      } else {
+        if (currentAction.newLine) sendReturn();
+        currentAction.type = NONE;
+      }
+      break;
+
+    case TYPE_LOREM_IPSUM:
+    case TYPE_LOREM_LINES:
+      {
+        const char* loremIpsumLines[] = {
+          "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ",
+          "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ",
+          "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ",
+          "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+        };
+        int numLines = sizeof(loremIpsumLines) / sizeof(loremIpsumLines[0]);
+        if (currentAction.lineIndex < numLines) {
+          if (currentAction.index < strlen(loremIpsumLines[currentAction.lineIndex])) {
+            char currentChar = loremIpsumLines[currentAction.lineIndex][currentAction.index];
+            if (isStopRequested) {
+              Keyboard.releaseAll();
+              currentAction.type = NONE;
+            } else {
+              Keyboard.press(currentChar);
+              keyPressWaitWithMinimum(10);
+              Keyboard.releaseAll();
+              keyIntervalWaitWithMinimum(10);
+              currentAction.index++;
+            }
+          } else {
+            if (currentAction.type == TYPE_LOREM_LINES) {
+              sendReturn();
+            }
+            currentAction.lineIndex++;
+            currentAction.index = 0;
+          }
+        } else {
+          currentAction.type = NONE;
+        }
+        break;
+      }
+
+    case SEND_KEY:
+      if (currentAction.index == 0) {
+        sendKey(currentAction.parameter, false);
+        currentAction.index++;
+      } else {
+        currentAction.type = NONE;
+      }
+      break;
+
+    case SEND_COMBO:
+      if (currentAction.index == 0) {
+        sendKeyCombination(currentAction.parameter);
+        currentAction.index++;
+      } else {
+        currentAction.type = NONE;
+      }
+      break;
+
+    case SEND_EDIT:
+      if (currentAction.index == 0) {
+        handleEditCommand(currentAction.parameter);
+        currentAction.index++;
+      } else {
+        currentAction.type = NONE;
+      }
+      break;
+
+    case HOLD_KEY:
+      if (currentAction.index == 0) {
+        sendKey(currentAction.parameter, true);
+        currentAction.index++;
+      } else {
+        currentAction.type = NONE;
+      }
+      break;
+
+    default:
+      currentAction.type = NONE;
+      break;
+  }
+
+  // If the action is done and system was busy, mark it as free and update the status
+  if (currentAction.type == NONE && isBusy) {
+    isBusy = false;
+    sendStatusResponse();  // Notify that the device is now free
+  }
+}
+
+
+void sendReturn() {
+  Keyboard.press('\n');
+  keyPressWaitWithMinimum(50);  // Delay before newline (optional, adjust as needed)
+  Keyboard.releaseAll();
+  keyIntervalWaitWithMinimum(50);
+}
+
+void sendPingResponse() {
+  Serial.println("RESPONSE:OK");  // Indicate that the command was received and processed successfully
+}
+
+void sendStatusResponse(bool fullStatus) {
+  if (fullStatus) {
+    // Full detailed status when requested
+    Serial.print(F("RESPONSE:{\"app\": \"RoboKeysDuino\", \"status\": \""));
+    Serial.print(isConnected ? "connected" : "disconnected");
+    Serial.print(F("\", \"ready\": \""));
+    Serial.print(isReady() ? "yes" : "no");
+    Serial.print(F("\", \"paused\": \""));
+    Serial.print(isPaused ? "yes" : "no");
+    Serial.print(F("\", \"debug\": \""));
+    Serial.print(isDebugEnabled ? "on" : "off");
+    Serial.print(F("\", \"echo\": \""));
+    Serial.print(isEchoEnabled ? "on" : "off");
+    Serial.print(F("\", \"output\": \""));
+    Serial.print(isStopRequested ? "off" : "on");
+    Serial.print(F("\", \"keyJitter\": \""));
+    Serial.print(addKeyJitter ? "on" : "off");
+    Serial.print(F("\", \"delayJitter\": \""));
+    Serial.print(addDelayJitter ? "on" : "off");
+
+    // Append optional fields only if they are non-zero
+    Serial.print(F(", \"KeyStrokeDelay\": "));
+    Serial.print(keystrokeDelay);
+    Serial.print(F(", \"keyPressLength\": "));
+    Serial.print(keyPressLength);
+
+    Serial.print(F(", \"keyJitterMaxValue\": "));
+    Serial.print(keyJitterMaxValue);
+
+    Serial.print(F(", \"delayJitterMaxValue\": "));
+    Serial.print(delayJitterMaxValue);
+
+    // Include a message based on the ready state
+    Serial.print(F(", \"message\": \""));
+    Serial.print(isReady() ? "Ready for commands." : "Not ready - only priority commands accepted.");
+    // Version information
+    Serial.print(F(", \"version\": \"0.5.2\""));
+    Serial.println(F("\"}"));
+
+  } else {
+    // Minimal status, similar to the full status, but for basic updates
+    Serial.print(F("RESPONSE:{\"app\": \"RoboKeysDuino\", \"paused\": \""));
+    Serial.print(isPaused ? "yes" : "no");
+    Serial.print(F("\", \"busy\": \""));
+    Serial.print(isBusy ? "yes" : "no");
+    Serial.println(F("\"}"));
+  }
+
+}
+
+String normalizeCommand(const String& command) {
+  const int MAX_COMMAND_LENGTH = 32;
+  char buffer[MAX_COMMAND_LENGTH + 1];  // Buffer for 32 characters + null terminator
+
+  // Copy up to the first 32 characters of the command into the buffer
+  command.toCharArray(buffer, MAX_COMMAND_LENGTH + 1);  // Copy with a null terminator
+
+  // Normalize the command in place (replace _ - . , space with :)
+  for (int i = 0; i < MAX_COMMAND_LENGTH && buffer[i] != '\0'; i++) {
+    if (buffer[i] == '_' || buffer[i] == ' ' || buffer[i] == '-' || buffer[i] == '.' || buffer[i] == ',') {
+      buffer[i] = ':';  // Replace delimiters with colons
+    }
+    buffer[i] = toupper(buffer[i]);  // Convert to uppercase
+  }
+
+  // Convert the normalized buffer back to a String and return it
+  return String(buffer);
+}
+
+
+bool isReady() {
+  return !isBusy && !isStopRequested;
+}
+
+CommandType parseCommandType(const String& command, String& parameter) {
+  debugMessage("<" + command + ">");
+  String normalizedCommand = normalizeCommand(command);
+
+  // Check each known command for a match
+  for (Command cmd : knownCommands) {
+    // Check if command starts with a known command
+    if (normalizedCommand.startsWith(cmd.name)) {
+      // If the command expects a parameter, extract it
+      if (cmd.hasParameter) {
+        parameter = normalizedCommand.substring(String(cmd.name).length());
+      }
+      return cmd.type;
+    }
+  }
+
+  // If no command matches, return INVALID
+  return INVALID;
 }
 
 void sendKey(const String& text, boolean hold) {
@@ -557,7 +701,6 @@ void sendKeyCombination(String keys) {
     }
   } else {
     // If the key is not a function key, assume it's a normal key
-    //Keyboard.press(mainKey.toInt());  // Convert to key code (assuming it's a key code)
     for (int i = 0; i < mainKey.length(); i++) {
       char currentChar = mainKey[i];
       if (isStopRequested) {
@@ -579,7 +722,7 @@ void sendKeyCombination(String keys) {
 void releaseKey(const String& text) {
   String upperCaseText = text;
   upperCaseText.toUpperCase();
-  debugMessage("Keyboard key send requested : " + upperCaseText);
+  debugMessage("Keyboard key release requested : " + upperCaseText);
   uint8_t keyCode = findKeyCode(upperCaseText);
   // Optional delay to ensure key press is registered
   Keyboard.release(keyCode);  // Release the key
@@ -589,7 +732,8 @@ void releaseKey(const String& text) {
 
 void resetArduino() {
   // Reset the Arduino Due
-  NVIC_SystemReset();
+  //NVIC_SystemReset();
+  restart();
 }
 
 void sendEditAction(char actionKey) {
@@ -601,30 +745,25 @@ void sendEditAction(char actionKey) {
   keyIntervalWaitWithMinimum(50);
 }
 
-// Function to perform the cut action (Ctrl + X)
 void cut() {
   sendEditAction('x');
   debugMessage("cut sent");
 }
 
-// Function to perform the copy action (Ctrl + C)
 void copy() {
   sendEditAction('c');
   debugMessage("copy sent");
 }
 
-// Function to perform the paste action (Ctrl + V)
 void paste() {
   sendEditAction('v');
   debugMessage("paste sent");
 }
 
-// Function to perform the select all action (Ctrl + A)
 void selectAll() {
   sendEditAction('a');
   debugMessage("Select all sent");
 }
-
 
 void handleEditCommand(const String& text) {
   debugMessage("Handling edit command");
@@ -644,18 +783,43 @@ void handleEditCommand(const String& text) {
   }
 }
 
-void handleCommand(const String& commandString) {
-  // might get extra blank lines , if terminator is CR/LF but can safely ignore them
-  if (commandString.length() > 0) {
-    String upperCaseCommandString = commandString;
-    upperCaseCommandString.toUpperCase();
-    CommandType type = parseCommandType(upperCaseCommandString);
-    String parameter = commandString.substring(commandString.indexOf(':') + 1);
+uint8_t findKeyCode(const String& text) {
+  for (size_t i = 0; i < sizeof(keyMappings) / sizeof(keyMappings[0]); i++) {
+    if (text.equals(keyMappings[i].text)) {
+      debugMessage("Key found: " + text + ", keyCode: " + String(keyMappings[i].keyCode));
+      return keyMappings[i].keyCode;
+    }
+  }
+  debugMessage("Key not found: " + text);
+  // Return 0 if key not found
+  return 0;
+}
 
+void handleCommand(const String& commandString) {
+  if (commandString.length() > 0) {
+    String parameter;                                      // Holds the command parameter if any
+    Command* cmd = findCommand(commandString, parameter);  // Find the command
+
+    if (!cmd) {
+      Serial.println("Invalid command.");
+      return;
+    }
+    // If the Arduino is busy, only allow priority commands
+
+    // Priority commands check when busy or paused
+    if (isPaused && cmd->type != CMD_RESUME && cmd->type != CMD_STOP && cmd->type != CMD_RESET) {
+      sendStatusResponse();
+      return;
+    }
+
+    if (isBusy && cmd->type != CMD_STOP && cmd->type != CMD_PAUSE && cmd->type != CMD_RESUME) {
+      sendStatusResponse();
+      return;
+    }
     // Declare variable outside of the switch statement
     int delayValue = 0;
 
-    switch (type) {
+    switch (cmd->type) {
       case HELP:
         printHelp();
         break;
@@ -666,37 +830,85 @@ void handleCommand(const String& commandString) {
         sendPingResponse();
         break;
       case STATUS:
-        sendStatusResponse();
+        sendStatusResponse(true);
         break;
       case LOREM:
-        typeLoremIpsum();
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = TYPE_LOREM_IPSUM;
+        currentAction.index = 0;
+        currentAction.lineIndex = 0;
+        currentAction.newLine = false;
         break;
       case LOREM_LINES:
-        typeLoremIpsum(true);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = TYPE_LOREM_LINES;
+        currentAction.index = 0;
+        currentAction.lineIndex = 0;
+        currentAction.newLine = true;
         break;
       case TEXT:
-        sendKeyboardMessage(parameter);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = SEND_MESSAGE;
+        currentAction.message = parameter;
+        currentAction.index = 0;
+        currentAction.newLine = false;
         break;
       case LINE:
-        sendKeyboardMessage(parameter, true);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = SEND_MESSAGE;
+        currentAction.message = parameter;
+        currentAction.index = 0;
+        currentAction.newLine = true;
         break;
       case KEY:
-        sendKey(parameter, false);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = SEND_KEY;
+        currentAction.parameter = parameter;
+        currentAction.index = 0;
         break;
       case COMBO:
-        sendKeyCombination(parameter);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = SEND_COMBO;
+        currentAction.parameter = parameter;
+        currentAction.index = 0;
         break;
       case EDIT:
-        handleEditCommand(parameter);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = SEND_EDIT;
+        currentAction.parameter = parameter;
+        currentAction.index = 0;
         break;
       case HOLD:
-        sendKey(parameter, true);
+        isStopRequested = false;  // Reset stop flag
+        currentAction.type = HOLD_KEY;
+        currentAction.parameter = parameter;
+        currentAction.index = 0;
+        break;
+      case CMD_STOP:
+        isStopRequested = true;
+        currentAction.type = NONE;  // Clear the current action
+        isBusy = false;
+        Keyboard.releaseAll();  // Release any pressed keys
+        sendStatusResponse();
+        debugMessage("Stop command received. Current action stopped and cleared.");
+        break;
+      case CMD_PAUSE:
+        isPaused = true;
+        //   Keyboard.releaseAll();  // Release any pressed keys
+        isBusy = false;
+        sendStatusResponse();
+        debugMessage("Pause command received. Typing paused.");
+        break;
+      case CMD_RESUME:
+        isPaused = false;
+        isStopRequested = false;  // Reset the stop flag here
+        debugMessage("Resume command received. Typing resumed. Stop flag cleared.");
         break;
       case RELEASE_KEY:
         releaseKey(parameter);
         break;
       case RELEASE_ALL_KEYS:
-        Keyboard.releaseAll();  // Release the key
+        Keyboard.releaseAll();  // Release all keys
         delay(50);
         break;
       case CMD_OUTPUT_OFF:
@@ -706,28 +918,32 @@ void handleCommand(const String& commandString) {
         isStopRequested = false;
         break;
       case CMD_SET_KEY_JITTER_VALUE:
-        // Move the variable declaration here
         keyJitterMaxValue = commandString.substring(23).toInt();  // Extract delay value from command
         debugMessage("Maximum key jitter value set to +/- " + String(keyJitterMaxValue) + " milliseconds");
         break;
       case CMD_SET_DELAY_JITTER_VALUE:
-        // Move the variable declaration here
         delayJitterMaxValue = commandString.substring(25).toInt();  // Extract delay value from command
         debugMessage("Maximum delay jitter value set to +/- " + String(delayJitterMaxValue) + " milliseconds");
         break;
       case CMD_SET_DELAY:
-        // Move the variable declaration here
         delayValue = commandString.substring(14).toInt();  // Extract delay value from command
         keystrokeDelay = delayValue;
         debugMessage("Additional Keystroke delay set to " + String(keystrokeDelay) + " milliseconds");
         break;
       case CMD_SET_PRESS_LENGTH:
         keyPressLength = commandString.substring(21).toInt();  // Extract delay value from command
-        debugMessage("Additional keypress time set to " + String(keystrokeDelay) + " milliseconds");
+        debugMessage("Additional keypress time set to " + String(keyPressLength) + " milliseconds");
         break;
       case CMD_RESET:
         // Handle reset command
-        delay(5000);
+        // Handle reset command by first sending a stop command
+        isStopRequested = true;
+        currentAction.type = NONE;  // Clear the current action
+        Keyboard.releaseAll();      // Release any pressed keys
+        isBusy = false;             // Ensure the device is not busy
+        sendStatusResponse();       // Notify that the device is stopping
+        delay(1000);                // Give time to process stop before reset
+        // Perform the reset after stop
         resetArduino();
         break;
       case CMD_ECHO_ON:
@@ -789,32 +1005,16 @@ void handleCommand(const String& commandString) {
         break;
       case INVALID:
         // Handle invalid command
-        Serial.println("Invalid command.");
+        Serial.print("Invalid command -> ");
+        Serial.println(commandString);
         break;
     }
   }
 }
 
-void debugMessage(const String& message) {
-  if (isDebugEnabled) {
-    Serial.print("DEBUG:");
-    Serial.println(message);
-  }
-}
-
-void infoMessage(const String& message) {
-  Serial.print("INFO:");
-  Serial.println(message);
-}
-
-void errorMessage(const String& message) {
-  Serial.print("ERROR:");
-  Serial.println(message);
-}
-
 String readSerialUntil(int maxLength) {
-
   String inputString = "";
+  bool started = false;  // To track when we encounter the first alphanumeric character
   while (true) {
     if (Serial.available() > 0) {
       char incomingChar = Serial.read();
@@ -825,12 +1025,20 @@ String readSerialUntil(int maxLength) {
         }
         // If the current character is CR, check if the next character is LF
         if (incomingChar == CR && Serial.peek() == LF) {
-          // Dont add the next character (LF) to the command string and break out of the loop
-          // it only doesnt get disguarded if it needs to be echoed back to the input device
+          // Don't add the next character (LF) to the command string and break out of the loop
           char disposedChar = Serial.read();
         }
         break;  // Exit the loop after processing LF or CR
       }
+
+      // Ignore non-alphanumeric characters before the first valid one
+      if (!started && !isAlphaNumeric(incomingChar)) {
+        continue;  // Skip to the next character
+      }
+
+      // Once we find the first alphanumeric character, start collecting the command
+      started = true;
+
       if (isEchoEnabled) {
         Serial.write(incomingChar);
       }
@@ -843,10 +1051,75 @@ String readSerialUntil(int maxLength) {
   return inputString;
 }
 
-void loop() {
-  String command = readSerialUntil(1024);  // Read until newline character or max chars
-  if (command.length() > 0) {
-    infoMessage("Sending To Keyboard: " + command);
+void printHelp(bool sendToKeyboard) {
+  // Define the help message
+  const char* helpMessage[] = {
+    "",
+    "ROBO-KEYBOARD",
+    "-------------",
+    "This uses an Arduino Due to act as a virtual keyboard, that can be used for keyboard macros or testing.",
+    "",
+    "Usage:",
+    "  HELP - Send this help text to the serial port.",
+    "  TYPE_HELP - Send this help text to the keyboard.",
+    "  PING - Check if the device is responsive",
+    "  STATUS - Get current status of the device",
+    "  LOREM - Type the Lorem Ipsum text on the keyboard",
+    "  LOREM_LINES - Type the Lorem Ipsum text on the keyboard, as 4 lines of text",
+    "  TEXT:<message> - Send a message as keystrokes",
+    "  LINE:<message> - Send a message followed by a newline",
+    "  KEY:<key> - Send a single key press",
+    "  COMBO:<keys> - Send a combination of keys (e.g., CTRL-ALT-DEL)",
+    "  EDIT:<action> - Perform an edit action (cut, copy, paste, selectall)",
+    "  HOLD:<key> - Hold a key down",
+    "  RELEASE_KEY:<key> - Release a specific key",
+    "  RELEASE:ALL - Release all held keys",
+    "  CMD:OUTPUT:OFF - Stop sending keys to the keyboard",
+    "  CMD:OUTPUT:ON - Resume sending keys to the keyboard",
+    "  CMD:SET:DELAY:<value> - Set delay between keystrokes",
+    "  CMD:SET:PRESS-LENGTH:<value> - Set the length of key presses",
+    "  CMD:RESET - Reset the device",
+    "  CMD:ECHO:ON - Enable echoing of serial input",
+    "  CMD:ECHO:OFF - Disable echoing of serial input",
+    "  CMD:DEBUG:ON - Enable debug messages",
+    "  CMD:DEBUG:OFF - Disable debug messages",
+    "  CMD:JITTER:ON - Enable jitter for both key press and release timings",
+    "  CMD:JITTER:OFF - Disable jitter for both key press and release timings",
+    "  CMD:KEY_JITTER:ON - Enable jitter for key press timings only",
+    "  CMD:KEY_JITTER:OFF - Disable jitter for key press timings only",
+    "  CMD:DELAY_JITTER:ON - Enable jitter for key interval timings only",
+    "  CMD:DELAY_JITTER:OFF - Disable jitter for key interval timings only",
+    "  CMD:SET:KEY_JITTER_MAX:<value> - Set maximum key press jitter value",
+    "  CMD:SET:DELAY_JITTER_MAX:<value> - Set maximum delay after keypress jitter value",
+    "  CMD:CONNECT - Connect the keyboard",
+    "  CMD:DISCONNECT - Disconnect the keyboard",
+    "  CMD:RECONNECT - Reconnect the keyboard",
+    "  CMD:STOP - Stop ongoing actions and clear pending text",
+    "  CMD:PAUSE - Pause ongoing actions without losing data.",
+    "  CMD:RESUME - Resume paused actions and reset stop state from CMD:STOP.",
+    "",
+    "NOTE: - can be substituted for _ in commands.",
+    "There are some shortnames for keys: @C is CTRL, @S is SHIFT, @A is ALT ",
+    "These @ modifiers will work in combo along wth the f-keys everything else appart from the seperator - there is assumed to be normal keys.",
+    "In the key command you can also use \\R or \\N as RETURN, \\B as BACKSPACE, \\T as TAB.",
+    ""
+  };
+
+  // Send the help message either to the Serial or to the Keyboard
+  for (const char* line : helpMessage) {
+    if (sendToKeyboard) {
+      // Send each line of the help message to the keyboard
+      currentAction.type = SEND_MESSAGE;
+      currentAction.message = line;
+      currentAction.index = 0;
+      currentAction.newLine = true;
+      // Process the action to send the line
+      while (currentAction.type != NONE) {
+        processCurrentAction();
+      }
+    } else {
+      // Send each line of the help message to the Serial
+      Serial.println(F(line));
+    }
   }
-  handleCommand(command);
 }
