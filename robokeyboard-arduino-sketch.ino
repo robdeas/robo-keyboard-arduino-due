@@ -4,7 +4,7 @@
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.   
+ * (at your option) any later version.  
 
  *
  * This program is distributed in the hope that it will be useful,
@@ -13,11 +13,19 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.   
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.  
+ *
+ * ----------------------------------------------------------------------
+ * This program emulates A VIRTUAL KEYBOARD using an Arduino Due
+ * it allows commands to be sent such as lorem which will cause the Arduino to type Lorem Ipsum.
  */
 #include <Keyboard.h>
 #include <sam.h>
 #include <HID.h>
+#include <stdint.h>
+#include <Arduino.h>
+#include <base64.hpp>
+#include <base64.hpp>
 
 // Define constants and structs
 struct KeyMapping {
@@ -25,7 +33,6 @@ struct KeyMapping {
   uint8_t keyCode;
 };
 
-String normalizeCommand(const String& command);
 
 enum CommandType {
   HELP,
@@ -60,19 +67,47 @@ enum CommandType {
   CMD_CONNECT,
   CMD_DISCONNECT,
   CMD_RECONNECT,
-  CMD_STOP,    // Added STOP command
-  CMD_PAUSE,   // Added PAUSE command
-  CMD_RESUME,  // Added RESUME command
+  CMD_SIMULATE_ON,
+  CMD_SIMULATE_OFF,
+  CMD_STOP,
+  CMD_PAUSE,
+  CMD_RESUME,
   RELEASE_KEY,
   RELEASE_ALL_KEYS,
+  PASSWORD,
+  PRIVATE_TEXT,
   INVALID
 };
 
+
+// Define UuidClearOption before any functions that use it
+enum UuidClearOption {
+  NO_CLEAR,  // Don't clear any UUID
+  PRIORITY,  // Clear only priorityUUID
+  NORMAL,    // Clear only normalUUID
+  BOTH       // Clear both UUIDs
+};
+
+
+// Define Command structure before usage
 struct Command {
   const char* name;
   CommandType type;
-  bool hasParameter;  // Indicate if this command expects a parameter
+  bool hasParameter;
 };
+
+
+String sanitizeSensitiveLog(CommandType type, const String& message, const String& uuid) {
+  switch (type) {
+    case PASSWORD:
+      return "Sensitive information (password) redacted for UUID: " + uuid;
+    case PRIVATE_TEXT:
+      return "Sensitive information (private text) redacted for UUID: " + uuid;
+    default:
+      return message;  // No sensitive information, return the original message
+  }
+}
+
 
 Command knownCommands[] = {
   { "HELP", HELP, false },
@@ -111,11 +146,35 @@ Command knownCommands[] = {
   { "CMD:RECONNECT", CMD_RECONNECT, false },
   { "CMD:STOP", CMD_STOP, false },
   { "CMD:PAUSE", CMD_PAUSE, false },
-  { "CMD:RESUME", CMD_RESUME, false }
+  { "CMD:RESUME", CMD_RESUME, false },
+  { "PASSWORD:", PASSWORD, true },
+  { "PRIVATE:TEXT:", PRIVATE_TEXT, true },
 };
 
+String base64Decode(const String& encoded) {
+  size_t outputLength = 0;                  // Output length isn't directly returned by this library
+  unsigned char decoded[encoded.length()];  // Allocate space for decoded data (adjust size if needed)
 
+  // Decode the Base64 string
+  unsigned int length = decode_base64(
+    (unsigned char*)encoded.c_str(),  // Input: Base64 encoded string
+    encoded.length(),                 // Length of the input string
+    decoded                           // Output: Decoded binary data
+  );
 
+  // Convert decoded output to String and return
+  return String((char*)decoded).substring(0, length);
+}
+
+String commandTypeToString(CommandType type) {
+  // Iterate over knownCommands array to find a matching CommandType
+  for (const Command& cmd : knownCommands) {
+    if (cmd.type == type) {
+      return cmd.name;  // Return the name if a match is found
+    }
+  }
+  return "UNKNOWN";  // Return "UNKNOWN" if the CommandType is not found
+}
 
 // Define an array of key mappings
 KeyMapping keyMappings[] = {
@@ -153,6 +212,7 @@ KeyMapping keyMappings[] = {
   { "BACKSPACE", KEY_BACKSPACE },
   { "TAB", KEY_TAB },
   { "RETURN", KEY_RETURN },
+  { "ENTER", KEY_RETURN },
   { "MENU", KEY_MENU },
   { "ESC", KEY_ESC },
   { "INSERT", KEY_INSERT },
@@ -253,7 +313,8 @@ void processCurrentAction();
 String readSerialUntil(int maxLength);
 void sendReturn();
 void sendPingResponse();
-void sendStatusResponse(bool fullStatus = false);
+
+void sendStatusResponse(bool fullStatus = false, UuidClearOption clearOption = NO_CLEAR);
 void printHelp(bool sendToKeyboard = false);
 bool isReady();
 
@@ -270,6 +331,131 @@ enum ActionType {
   // Add other action types as needed
 };
 
+// Define Command structure before usage
+struct UuidInfo {
+  String uuid;
+  bool isArtificial;
+};
+
+// Define an empty UuidInfo to use for resetting
+UuidInfo emptyUuidInfo = { "", false };
+
+// Global UUID variables for normal and priority commands
+UuidInfo priorityUUID = { "", false };
+UuidInfo normalUUID = { "", false };
+
+String normalizeCommand(const String& command);
+
+// Why crc24 ? Its to keep as many bits of the v8 generated uuid as random as possible but allow for a mostly increasing timestamp (over 2 weeks) and a hash of the board id
+// the 24 bit parts are not intended to be univerally unique, just give some nice values for testing. Usually the UUID will be supplied by the calling PC program
+// and will be a standard v4 uuid
+uint32_t calculateCRC24(const String& input) {
+  uint32_t crc = 0xB704CE;  // Initial value, can be adjusted based on polynomial
+  const uint32_t polynomial = 0x864CFB;
+
+  for (char c : input) {
+    crc ^= (uint8_t)c << 16;  // Shift left to match 24-bit polynomial length
+
+    for (int i = 0; i < 8; i++) {
+      if (crc & 0x800000) {  // Check the 24th bit
+        crc = (crc << 1) ^ polynomial;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+
+  return crc & 0xFFFFFF;  // Mask to keep only the lower 24 bits
+}
+
+void seedRandomNumberGenerator() {
+  // Read from spaced floating analog pins
+  uint16_t analogValue1 = analogRead(A0);  // Read from analog pin A0
+  delay(1);                                // Short delay to allow for ADC settling
+  uint16_t analogValue2 = analogRead(A2);  // Read from analog pin A2
+  delay(1);
+  uint16_t analogValue3 = analogRead(A4);  // Read from analog pin A4
+
+  // Get the current micros() value
+  unsigned long timeValue = micros();  // Get the current time in microseconds
+
+  // Combine the values to create a seed
+  unsigned long seedValue = 0;
+  seedValue ^= ((unsigned long)analogValue1 << 20);  // Shift and combine analogValue1
+  seedValue ^= ((unsigned long)analogValue2 << 10);  // Shift and combine analogValue2
+  seedValue ^= (unsigned long)analogValue3;          // Combine analogValue3 directly
+  seedValue ^= timeValue;                            // XOR with micros() value
+
+  // Seed the random number generator
+  randomSeed(seedValue);
+}
+
+String generateUUIDv8() {
+  // Compute CRC16 of the chip ID
+  String chipId = getChipId();
+  uint32_t crc24 = calculateCRC24(getChipId());
+
+  // Seed the random number generator
+  seedRandomNumberGenerator();
+
+  // 24-bit timestamp in tenths of a second, rolls over every 14 days (1,209,600 seconds)
+  uint32_t timeTenths = (millis() / 100UL) % 12096000UL;  // Rolls over every 14 days
+
+  uint8_t uuid[16];
+
+  // Initialize uuid with random bytes, Start from byte 6 as we override bytes 0-5
+  for (int i = 6; i < 16; i++) {
+    uuid[i] = random(0, 256);
+  }
+  // we then override certain bytes
+  // Set bytes 0-2 to crc24 (24 bits)
+  uuid[0] = (crc24 >> 16) & 0xFF;  // Bits 23-16
+  uuid[1] = (crc24 >> 8) & 0xFF;   // Bits 15-8
+  uuid[2] = crc24 & 0xFF;          // Bits 7-0
+
+  // Set bytes 3-5 to time in tenths of seconds (24 bits)
+  uuid[3] = (timeTenths >> 16) & 0xFF;  // Bits 23-16
+  uuid[4] = (timeTenths >> 8) & 0xFF;   // Bits 15-8
+  uuid[5] = timeTenths & 0xFF;          // Bits 7-0
+
+  // Set version to 8 in the high 4 bits of byte 6
+  uuid[6] = (uuid[6] & 0x0F) | 0x80;
+
+  // Set variant to RFC 4122 in byte 8
+  uuid[8] = (uuid[8] & 0x3F) | 0x80;  // Variant 1
+
+  // Format UUID as a string with dashes using snprintf for clarity
+  char uuidStr[37];  // 36 characters + null terminator
+  snprintf(uuidStr, sizeof(uuidStr),
+           "%02X%02X-%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+           uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+           uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+
+  // Return as a String object, which will auto-handle capitalisation
+  return String(uuidStr);
+}
+
+
+
+// Retrieve unique chip ID for Arduino Due (SAM3X8E)
+String getChipId() {
+  uint32_t uid[4];
+  uid[0] = *(uint32_t*)0x400E0740;  // REG_UID0 address
+  uid[1] = *(uint32_t*)0x400E0744;  // REG_UID1 address
+  uid[2] = *(uint32_t*)0x400E0748;  // REG_UID2 address
+  uid[3] = *(uint32_t*)0x400E074C;  // REG_UID3 address
+
+  String chipId = "";
+  for (int i = 0; i < 4; i++) {
+    String hexPart = String(uid[i], HEX);
+    while (hexPart.length() < 8) {
+      hexPart = "0" + hexPart;  // Pad with leading zeros
+    }
+    chipId += hexPart;
+  }
+  return chipId;
+}
+
 struct Action {
   ActionType type;
   String message;
@@ -277,18 +463,48 @@ struct Action {
   int lineIndex;
   bool newLine;
   String parameter;
-  // Add other fields as needed
 };
 
 Action currentAction = { NONE };
 
+void handleSecureTextCommand(const String& encodedText, const String& commandName) {
+  // Decode the Base64 text
+  String decodedText = base64Decode(encodedText);
+
+  // Log only the UUID
+  infoMessage("Typing " + commandName + " (UUID only logged).");
+  debugMessage("UUID for " + commandName + " command: " + normalUUID.uuid);
+
+  // Send the decoded text as keystrokes
+  for (size_t i = 0; i < decodedText.length(); i++) {
+    char currentChar = decodedText[i];
+
+    // Handle newline characters explicitly
+    if ((currentChar == '\r' && decodedText[i + 1] == '\n') || currentChar == '\n') {
+      i++;  // Skip '\n' if '\r' was already processed
+      Keyboard.press(KEY_RETURN);
+      keyPressWaitWithMinimum(50);
+      Keyboard.releaseAll();
+      keyIntervalWaitWithMinimum(50);
+    } else {
+      // Send regular characters
+      Keyboard.press(currentChar);
+      keyPressWaitWithMinimum(10);
+      Keyboard.releaseAll();
+      keyIntervalWaitWithMinimum(10);
+    }
+  }
+}
+
+
+
 void setup() {
   delay(150);
   // Start the serial communication
-  Serial.begin(9600);
+  Serial.begin(115200);
   Keyboard.begin();
   isConnected = true;
-  // Wait for a stable connection (optional)
+  // Wait for a stable connection
   // Wait for Serial connection with a 2-second timeout
   unsigned long startTime = millis();
   while (!Serial && (millis() - startTime < 2000)) {
@@ -326,23 +542,93 @@ void loop() {
   processCurrentAction();
 }
 
+String escapeForJson(const String& input) {
+  String output = "";
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    switch (c) {
+      case '\"': output += "\\\""; break;
+      case '\\': output += "\\\\"; break;
+      case '\n': output += "\\n"; break;
+      case '\r': output += "\\r"; break;
+      case '\t': output += "\\t"; break;
+      default: output += c; break;
+    }
+  }
+  return output;
+}
+
 // Implementations of functions
 
 void infoMessage(const String& message) {
-  Serial.print("INFO:");
-  Serial.println(message);
+  Serial.print(F("{\"level\": \"INFO\", \"message\": \""));
+  Serial.print(escapeForJson(message));
+
+  // Include UUIDs if they’re set, with "artificialId" if applicable
+  if (priorityUUID.uuid) {
+    Serial.print(F("\", \"priorityUUID\": \""));
+    Serial.print(priorityUUID.uuid);
+    if (priorityUUID.isArtificial) {
+      Serial.print(F("\", \"artificialId\": true"));
+    }
+  }
+  if (normalUUID.uuid) {
+    Serial.print(F("\", \"commandUUID\": \""));
+    Serial.print(normalUUID.uuid);
+    if (normalUUID.isArtificial) {
+      Serial.print(F("\", \"artificialId\": true"));
+    }
+  }
+
+  Serial.println(F("\"}"));
 }
 
 void debugMessage(const String& message) {
   if (isDebugEnabled) {
-    Serial.print("DEBUG:");
-    Serial.println(message);
+    Serial.print(F("{\"level\": \"DEBUG\", \"message\": \""));
+    Serial.print(escapeForJson(message));
+
+    // Include UUIDs if they’re set, with "artificialId" if applicable
+    if (priorityUUID.uuid) {
+      Serial.print(F("\", \"priorityUUID\": \""));
+      Serial.print(priorityUUID.uuid);
+      if (priorityUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+    if (normalUUID.uuid) {
+      Serial.print(F("\", \"commandUUID\": \""));
+      Serial.print(normalUUID.uuid);
+      if (normalUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+
+    Serial.println(F("\"}"));
   }
 }
 
 void errorMessage(const String& message) {
-  Serial.print("ERROR:");
-  Serial.println(message);
+  Serial.print(F("{\"level\": \"ERROR\", \"message\": \""));
+  Serial.print(escapeForJson(message));
+
+  // Include UUIDs if they’re set, with "artificialId" if applicable
+  if (priorityUUID.uuid) {
+    Serial.print(F("\", \"priorityUUID\": \""));
+    Serial.print(priorityUUID.uuid);
+    if (priorityUUID.isArtificial) {
+      Serial.print(F("\", \"artificialId\": true"));
+    }
+  }
+  if (normalUUID.uuid) {
+    Serial.print(F("\", \"commandUUID\": \""));
+    Serial.print(normalUUID.uuid);
+    if (normalUUID.isArtificial) {
+      Serial.print(F("\", \"artificialId\": true"));
+    }
+  }
+
+  Serial.println(F("\"}"));
 }
 
 void keyPressWaitWithMinimum(int minimum) {
@@ -351,6 +637,10 @@ void keyPressWaitWithMinimum(int minimum) {
 
 void keyIntervalWaitWithMinimum(int minimum) {
   waitWithMinimumValues(minimum, keystrokeDelay, delayJitterMaxValue, addDelayJitter);
+}
+
+int clamp(int value, int min, int max) {
+  return value < min ? min : (value > max ? max : value);
 }
 
 /**
@@ -368,31 +658,41 @@ void waitWithMinimumValues(int minimum, int delayMillisSetting, int jitterMaxVal
     } else {
       delayMillis -= jitter;
     }
-    if (delayMillis < 0) {
-      delayMillis = 0;  // Ensure delayMillis is not negative
-    }
+    // if (delayMillis < 0) {
+    //   delayMillis = 0;  // Ensure delayMillis is not negative
+    // }
+    delayMillis = clamp(delayMillis, minimum, jitterMaxValue + minimum);
   }
   if (delayMillis < minimum) delayMillis = minimum;
   if (addJitter) debugMessage("Delay applied: " + String(delayMillis));
   delay(delayMillis);
 }
 
+
+// check if a command is a priority command
+bool isPriorityCommand(CommandType type) {
+  return type == CMD_STOP || type == CMD_PAUSE || type == CMD_RESUME || type == CMD_RESET;
+}
+
 // Function to find a command and its parameter from the normalized command string
 Command* findCommand(const String& command, String& parameter) {
   String normalizedCommand = normalizeCommand(command);  // Normalize the command if needed
 
-  // Iterate through knownCommands[] to find a matching command
+  // Iterate through knownCommands[] to find the longest matching command
+  Command* bestMatch = nullptr;
+
   for (Command& cmd : knownCommands) {
     if (normalizedCommand.startsWith(cmd.name)) {
-      if (cmd.hasParameter) {
+      if (!bestMatch || strlen(cmd.name) > strlen(bestMatch->name)) {
+        bestMatch = &cmd;                                          // Update to the best match found
         parameter = command.substring(String(cmd.name).length());  // Extract parameter if expected
       }
-      return &cmd;
     }
   }
 
-  return nullptr;  // Return nullptr if no matching command is found
+  return bestMatch;  // Return the longest match found, or nullptr if no match
 }
+
 
 void processCurrentAction() {
   // If no action is currently being processed or the system is stopped or paused
@@ -400,7 +700,7 @@ void processCurrentAction() {
     // If the system was busy, but now it's free, update the status once
     if (isBusy) {
       isBusy = false;
-      sendStatusResponse();  // Notify that the device is now free
+      sendStatusResponse(false, BOTH);  // Notify that the device is now free
     }
     return;
   }
@@ -528,7 +828,7 @@ void sendPingResponse() {
   Serial.println("RESPONSE:OK");  // Indicate that the command was received and processed successfully
 }
 
-void sendStatusResponse(bool fullStatus) {
+void sendStatusResponse(bool fullStatus, UuidClearOption clearOption) {
   if (fullStatus) {
     // Full detailed status when requested
     Serial.print(F("RESPONSE:{\"app\": \"RoboKeysDuino\", \"status\": \""));
@@ -560,11 +860,29 @@ void sendStatusResponse(bool fullStatus) {
     Serial.print(F(", \"delayJitterMaxValue\": "));
     Serial.print(delayJitterMaxValue);
 
+    // Include UUIDs if they’re set
+    // Include UUIDs if they’re set, with "artificialId" if applicable
+    if (priorityUUID.uuid) {
+      Serial.print(F("\", \"priorityUUID\": \""));
+      Serial.print(priorityUUID.uuid);
+      if (priorityUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+    if (normalUUID.uuid) {
+      Serial.print(F("\", \"commandUUID\": \""));
+      Serial.print(normalUUID.uuid);
+      if (normalUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+
     // Include a message based on the ready state
     Serial.print(F(", \"message\": \""));
     Serial.print(isReady() ? "Ready for commands." : "Not ready - only priority commands accepted.");
+
     // Version information
-    Serial.print(F(", \"version\": \"0.5.2\""));
+    Serial.print(F(", \"version\": \"0.6.0\""));
     Serial.println(F("\"}"));
 
   } else {
@@ -573,9 +891,41 @@ void sendStatusResponse(bool fullStatus) {
     Serial.print(isPaused ? "yes" : "no");
     Serial.print(F("\", \"busy\": \""));
     Serial.print(isBusy ? "yes" : "no");
+    // Include UUIDs if they’re set, with artificialId if applicable
+    if (priorityUUID.uuid) {
+      Serial.print(F("\", \"priorityUUID\": \""));
+      Serial.print(priorityUUID.uuid);
+      if (priorityUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+    if (normalUUID.uuid) {
+      Serial.print(F("\", \"commandUUID\": \""));
+      Serial.print(normalUUID.uuid);
+      if (normalUUID.isArtificial) {
+        Serial.print(F("\", \"artificialId\": true"));
+      }
+    }
+
     Serial.println(F("\"}"));
   }
 
+  // Clear UUIDs based on the clearOption enum
+  switch (clearOption) {
+    case PRIORITY:
+      priorityUUID = emptyUuidInfo;
+      break;
+    case NORMAL:
+      normalUUID = emptyUuidInfo;
+      break;
+    case BOTH:
+      priorityUUID = emptyUuidInfo;
+      normalUUID = emptyUuidInfo;
+      break;
+    case NONE:
+    default:
+      break;
+  }
 }
 
 String normalizeCommand(const String& command) {
@@ -604,25 +954,29 @@ bool isReady() {
 
 CommandType parseCommandType(const String& command, String& parameter) {
   debugMessage("<" + command + ">");
+
+  // Ensure the command is normalized
   String normalizedCommand = normalizeCommand(command);
 
   // Check each known command for a match
   for (Command cmd : knownCommands) {
-    // Check if command starts with a known command
     if (normalizedCommand.startsWith(cmd.name)) {
       // If the command expects a parameter, extract it
       if (cmd.hasParameter) {
-        parameter = normalizedCommand.substring(String(cmd.name).length());
+        parameter = command.substring(String(cmd.name).length());  // Extract parameter
+        parameter.trim();                                          // Trim spaces
       }
       return cmd.type;
     }
   }
 
-  // If no command matches, return INVALID
-  return INVALID;
+  return INVALID;  // No match found
 }
 
+
+
 void sendKey(const String& text, boolean hold) {
+
   String upperCaseText = text;
   upperCaseText.toUpperCase();
   Serial.println("Keyboard key send requested : " + text);
@@ -645,6 +999,7 @@ void sendKey(const String& text, boolean hold) {
 }
 
 void sendKeyCombination(String keys) {
+
   String lowerCaseModifiers = keys;
   lowerCaseModifiers.toLowerCase();
 
@@ -720,6 +1075,7 @@ void sendKeyCombination(String keys) {
 }
 
 void releaseKey(const String& text) {
+
   String upperCaseText = text;
   upperCaseText.toUpperCase();
   debugMessage("Keyboard key release requested : " + upperCaseText);
@@ -737,6 +1093,7 @@ void resetArduino() {
 }
 
 void sendEditAction(char actionKey) {
+
   Keyboard.press(KEY_LEFT_CTRL);
   keyPressWaitWithMinimum(10);
   Keyboard.press(actionKey);
@@ -795,14 +1152,43 @@ uint8_t findKeyCode(const String& text) {
   return 0;
 }
 
-void handleCommand(const String& commandString) {
+String jsonEscape(const String& input) {
+  String escaped = "\"";  // Start with a double quote for JSON compatibility
+  for (unsigned int i = 0; i < input.length(); i++) {
+    char c = input[i];
+    switch (c) {
+      case '\"': escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default:
+        if (c < 0x20 || c > 0x7E) {
+          // Convert non-printable characters to Unicode escape sequence
+          char buffer[7];
+          snprintf(buffer, sizeof(buffer), "\\u%04X", c);
+          escaped += buffer;
+        } else {
+          escaped += c;
+        }
+    }
+  }
+  escaped += "\"";  // End with a double quote
+  return escaped;
+}
+
+void processCommand(const String& commandString) {
   if (commandString.length() > 0) {
     String parameter;                                      // Holds the command parameter if any
     Command* cmd = findCommand(commandString, parameter);  // Find the command
 
     if (!cmd) {
-      Serial.println("Invalid command.");
+      Serial.println("Invalid command: " + jsonEscape(commandString.substring(32)));
       return;
+    } else {
+      Serial.println("Processing command: " + jsonEscape(commandTypeToString(cmd->type)));
     }
     // If the Arduino is busy, only allow priority commands
 
@@ -830,7 +1216,7 @@ void handleCommand(const String& commandString) {
         sendPingResponse();
         break;
       case STATUS:
-        sendStatusResponse(true);
+        sendStatusResponse(true, NORMAL);
         break;
       case LOREM:
         isStopRequested = false;  // Reset stop flag
@@ -889,26 +1275,27 @@ void handleCommand(const String& commandString) {
         currentAction.type = NONE;  // Clear the current action
         isBusy = false;
         Keyboard.releaseAll();  // Release any pressed keys
-        sendStatusResponse();
+        sendStatusResponse(false, BOTH);
         debugMessage("Stop command received. Current action stopped and cleared.");
         break;
       case CMD_PAUSE:
         isPaused = true;
         //   Keyboard.releaseAll();  // Release any pressed keys
         isBusy = false;
-        sendStatusResponse();
+        sendStatusResponse(false, PRIORITY);
         debugMessage("Pause command received. Typing paused.");
         break;
       case CMD_RESUME:
         isPaused = false;
         isStopRequested = false;  // Reset the stop flag here
         debugMessage("Resume command received. Typing resumed. Stop flag cleared.");
+        sendStatusResponse(false, PRIORITY);
         break;
       case RELEASE_KEY:
         releaseKey(parameter);
         break;
       case RELEASE_ALL_KEYS:
-        Keyboard.releaseAll();  // Release all keys
+        Keyboard.releaseAll();
         delay(50);
         break;
       case CMD_OUTPUT_OFF:
@@ -938,11 +1325,11 @@ void handleCommand(const String& commandString) {
         // Handle reset command
         // Handle reset command by first sending a stop command
         isStopRequested = true;
-        currentAction.type = NONE;  // Clear the current action
-        Keyboard.releaseAll();      // Release any pressed keys
-        isBusy = false;             // Ensure the device is not busy
-        sendStatusResponse();       // Notify that the device is stopping
-        delay(1000);                // Give time to process stop before reset
+        currentAction.type = NONE;        // Clear the current action
+        Keyboard.releaseAll();            // Release any pressed keys
+        isBusy = false;                   // Ensure the device is not busy
+        sendStatusResponse(false, BOTH);  // Notify that the device is stopping
+        delay(1000);                      // Give time to process stop before reset
         // Perform the reset after stop
         resetArduino();
         break;
@@ -978,6 +1365,23 @@ void handleCommand(const String& commandString) {
       case CMD_DELAY_JITTER_OFF:
         addDelayJitter = false;
         break;
+      case PASSWORD:
+        // This is a sensitive command so its all kept here and not split into an action
+        if (parameter.length() > 0) {
+          handleSecureTextCommand(parameter, "password");
+          sendReturn();
+        } else {
+          errorMessage("Password command missing parameter.");
+        }
+        break;
+      case PRIVATE_TEXT:
+        // This is a sensitive command so its all kept here and not split into an action
+        if (parameter.length() > 0) {
+          handleSecureTextCommand(parameter, "private-text");
+        } else {
+          errorMessage("private-text command missing parameter.");
+        }
+        break;
       case CMD_CONNECT:
         // Handle connect command
         if (!isConnected) {
@@ -995,60 +1399,160 @@ void handleCommand(const String& commandString) {
         debugMessage("Keyboard is now disconnected");
         break;
       case CMD_RECONNECT:
-        // Handle reconnect command
+        // Disconnect the keyboard
+        isConnected = false;  // Update status flag to show disconnection
+        debugMessage("Keyboard disconnected.");
         Keyboard.end();
-        delay(500);
+        delay(500);  // Brief delay to allow the host to register the disconnect
+
+        // Reconnect the keyboard
         Keyboard.begin();
-        delay(500);
-        isConnected = true;  // Simulate keyboard connection
-        debugMessage("Keyboard reconnected");
+        delay(500);          // Brief delay to allow the connection to establish
+        isConnected = true;  // Update status flag to show connection
+        debugMessage("Keyboard reconnected.");
         break;
+
       case INVALID:
         // Handle invalid command
         Serial.print("Invalid command -> ");
         Serial.println(commandString);
         break;
     }
+
+    // Reset priorityUUID if the command is priority, otherwise reset normalUUID
+    if (isPriorityCommand(cmd->type)) {
+      priorityUUID = emptyUuidInfo;
+    } else {
+      normalUUID = emptyUuidInfo;
+    }
   }
 }
 
+
+// Step 3: Adjust the handleCommand function to store the UUID accordingly
+void handleCommand(const String& commandString) {
+  String uuid;
+  CommandType commandType;
+  String actualCommand;
+  bool startsWithId = false;
+
+  String trimmedCommand = commandString;
+  trimmedCommand.trim();  // Trim in place
+  if (trimmedCommand.length() == 0) {
+    Serial.println("Ignoring empty command.");
+    return;
+  }
+
+  if (commandString.length() >= 3) {
+    String strLower = commandString.substring(0, 3);
+    strLower.toLowerCase();
+    if (strLower.startsWith("id=")) {
+      startsWithId = true;
+    }
+  }
+  if (startsWithId) {  // Command has a UUID
+    int commaIndex = commandString.indexOf(',');
+    uuid = commandString.substring(3, commaIndex);  // Extract UUID
+    actualCommand = commandString.substring(commaIndex + 1);
+  } else {  // No UUID, generate a new v8 UUID
+    uuid = generateUUIDv8();
+    actualCommand = commandString;
+  }
+
+  String parameter;
+  commandType = parseCommandType(actualCommand, parameter);
+
+  // Store generated UUID in the correct global based on command priority
+  if (isPriorityCommand(commandType)) {
+    priorityUUID.uuid = uuid.c_str();  // Assign the C-string to the uuid field
+    priorityUUID.isArtificial = true;
+  } else {
+    normalUUID.uuid = uuid.c_str();  // Assign the C-string to the uuid field
+    normalUUID.isArtificial = true;
+  }
+
+  processCommand(actualCommand);  // Process the command
+}
+
+String applyUnnormalizedChars(const String& normalized, const String& raw) {
+  String redactedCommand = "";  // Result after replacing colons with original chars
+
+  for (size_t i = 0; i < normalized.length(); ++i) {
+    char normalizedChar = normalized.charAt(i);
+    char rawChar = raw.charAt(i);
+
+    if (normalizedChar == ':') {
+      // Replace colon with the corresponding raw character
+      redactedCommand += rawChar;
+    } else {
+      // Keep the normalized character as is
+      redactedCommand += normalizedChar;
+    }
+  }
+
+  return redactedCommand;
+}
+
 String readSerialUntil(int maxLength) {
-  String inputString = "";
-  bool started = false;  // To track when we encounter the first alphanumeric character
+  String rawInputString = "";         // Original input string
+  String normalizedInputString = "";  // Normalized input
+  bool started = false;
+
   while (true) {
     if (Serial.available() > 0) {
       char incomingChar = Serial.read();
+      rawInputString += incomingChar;
 
+      // Check for line-ending characters
       if (incomingChar == LF || incomingChar == CR) {
-        if (isEchoEnabled) {
-          Serial.println("");
-        }
-        // If the current character is CR, check if the next character is LF
-        if (incomingChar == CR && Serial.peek() == LF) {
-          // Don't add the next character (LF) to the command string and break out of the loop
-          char disposedChar = Serial.read();
-        }
-        break;  // Exit the loop after processing LF or CR
+        break;
       }
 
-      // Ignore non-alphanumeric characters before the first valid one
       if (!started && !isAlphaNumeric(incomingChar)) {
-        continue;  // Skip to the next character
+        continue;
       }
-
-      // Once we find the first alphanumeric character, start collecting the command
       started = true;
 
-      if (isEchoEnabled) {
-        Serial.write(incomingChar);
+      char normalizedChar = incomingChar;
+
+      // Normalize character
+      if (normalizedChar == '_' || normalizedChar == ' ' || normalizedChar == '-' || normalizedChar == '.' || normalizedChar == ',') {
+        normalizedChar = ':';  // Replace with colon
       }
-      inputString += incomingChar;  // Add the character to the input string
-      if (inputString.length() >= maxLength) {
-        break;  // Exit the loop if the maximum length is reached
+      normalizedChar = toupper(normalizedChar);  // Convert to uppercase
+      normalizedInputString += normalizedChar;
+
+      if (normalizedInputString.endsWith("PASSWORD:")) {
+        Serial.println("Detected sensitive command. Redacting...");
+        String redactedNormalized = normalizedInputString + "<VALUE REDACTED>";
+        String finalRedacted = applyUnnormalizedChars(redactedNormalized, rawInputString);
+        Serial.println("Redacted Command: " + finalRedacted);
+        break;
+      }
+      else if (normalizedInputString.endsWith("PRIVATE:")) {
+        Serial.println("Detected sensitive command. Redacting...");
+        String redactedNormalized = normalizedInputString + "<VALUE REDACTED>";
+        String finalRedacted = applyUnnormalizedChars(redactedNormalized, rawInputString);
+        Serial.println("Redacted Private text: " + finalRedacted);
+        break;
+      }
+
+      if (rawInputString.length() >= maxLength) {
+        break;
       }
     }
   }
-  return inputString;
+
+  rawInputString.trim();  // Trim in place
+  if (rawInputString.length() == 0) {
+    Serial.println("No valid input received.");
+    return "";  // Return empty string for invalid input
+  }
+
+  Serial.println("Raw Input: " + rawInputString);
+  Serial.println("Normalized Input: " + normalizedInputString);
+
+  return rawInputString;  // Return the raw input
 }
 
 void printHelp(bool sendToKeyboard) {
@@ -1100,7 +1604,7 @@ void printHelp(bool sendToKeyboard) {
     "",
     "NOTE: - can be substituted for _ in commands.",
     "There are some shortnames for keys: @C is CTRL, @S is SHIFT, @A is ALT ",
-    "These @ modifiers will work in combo along wth the f-keys everything else appart from the seperator - there is assumed to be normal keys.",
+    "These @ modifiers will work in combo along wth the f-keys everything else appart from the seperator is assumed to be normal keys.",
     "In the key command you can also use \\R or \\N as RETURN, \\B as BACKSPACE, \\T as TAB.",
     ""
   };
